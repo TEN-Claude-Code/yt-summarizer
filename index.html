@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="YT要約" />
+  <meta name="theme-color" content="#0f0f1a" />
+  <title>YouTube Summarizer</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>▶</text></svg>" />
+  <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%230f0f1a' width='100' height='100' rx='20'/><text x='50' y='65' text-anchor='middle' font-size='50'>▶</text></svg>" />
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body { background: #0f0f1a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    @keyframes spin { to { transform: rotate(360deg) } }
+    input::placeholder, textarea::placeholder { color: #555 }
+    select option { background: #1a1a2e; color: #fff }
+
+    /* PWA-like feel */
+    @supports(padding: max(0px)) {
+      .app-container { padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
+
+    const MODELS = [
+      { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash (速い)" },
+      { id: "gemini-2.5-flash-preview-05-20", label: "Gemini 2.5 Flash (賢い)" },
+    ];
+
+    const PROMPTS = {
+      summary: {
+        label: "📝 要約",
+        prompt: `この動画を日本語で要約してください。以下の構成でお願いします：
+
+## 概要（1-2文）
+
+## 主要ポイント（箇条書き）
+
+## 詳細まとめ（各ポイントを簡潔に解説）
+
+## 結論・アクションアイテム`,
+      },
+      keypoints: {
+        label: "🎯 要点抽出",
+        prompt: "この動画から重要なポイントだけを日本語で抽出してください。各ポイントにタイムスタンプ（わかれば）を添えて箇条書きにしてください。",
+      },
+      actionable: {
+        label: "✅ アクション化",
+        prompt: "この動画の内容を、実行可能なアクションアイテムのリストに変換してください。日本語で、優先度（高/中/低）も付けてください。",
+      },
+      custom: {
+        label: "✏️ カスタム",
+        prompt: "",
+      },
+    };
+
+    const LS_KEY = "yt_summarizer_api_key";
+    const LS_HISTORY = "yt_summarizer_history";
+
+    function App() {
+      const [apiKey, setApiKey] = useState("");
+      const [keyVisible, setKeyVisible] = useState(false);
+      const [keySaved, setKeySaved] = useState(false);
+      const [url, setUrl] = useState("");
+      const [model, setModel] = useState(MODELS[0].id);
+      const [promptType, setPromptType] = useState("summary");
+      const [customPrompt, setCustomPrompt] = useState("");
+      const [result, setResult] = useState("");
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState("");
+      const [history, setHistory] = useState([]);
+      const [copied, setCopied] = useState(false);
+      const resultRef = useRef(null);
+
+      useEffect(() => {
+        try {
+          const saved = localStorage.getItem(LS_KEY);
+          if (saved) { setApiKey(saved); setKeySaved(true); }
+          const h = localStorage.getItem(LS_HISTORY);
+          if (h) setHistory(JSON.parse(h));
+        } catch (e) {}
+      }, []);
+
+      const saveKey = () => {
+        localStorage.setItem(LS_KEY, apiKey);
+        setKeySaved(true);
+      };
+
+      const clearKey = () => {
+        localStorage.removeItem(LS_KEY);
+        setApiKey("");
+        setKeySaved(false);
+      };
+
+      const extractVideoId = (inputUrl) => {
+        const patterns = [
+          /(?:youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/,
+          /(?:youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+          /(?:youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
+          /(?:youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
+        ];
+        for (const p of patterns) {
+          const m = inputUrl.match(p);
+          if (m) return m[1];
+        }
+        return null;
+      };
+
+      const summarize = async () => {
+        if (!apiKey.trim()) { setError("APIキーを入力してください"); return; }
+        const videoId = extractVideoId(url);
+        if (!videoId) { setError("有効なYouTube URLを入力してください"); return; }
+
+        setLoading(true);
+        setError("");
+        setResult("");
+
+        const ytUrl = "https://www.youtube.com/watch?v=" + videoId;
+        const prompt = promptType === "custom" ? customPrompt : PROMPTS[promptType].prompt;
+
+        if (!prompt.trim()) { setError("プロンプトを入力してください"); setLoading(false); return; }
+
+        try {
+          const endpoint = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + apiKey;
+          const body = {
+            contents: [{
+              parts: [
+                { file_data: { file_uri: ytUrl, mime_type: "video/*" } },
+                { text: prompt },
+              ],
+            }],
+            generationConfig: { temperature: 0.4, maxOutputTokens: 4096 },
+          };
+
+          const res = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+
+          const data = await res.json();
+          if (!res.ok) throw new Error(data?.error?.message || "API Error " + res.status);
+
+          const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") || "応答が空でした";
+
+          setResult(text);
+          const newHistory = [
+            { url: ytUrl, videoId, promptType, model, result: text, time: new Date().toLocaleString("ja-JP") },
+            ...history,
+          ].slice(0, 20);
+          setHistory(newHistory);
+          try { localStorage.setItem(LS_HISTORY, JSON.stringify(newHistory)); } catch (e) {}
+
+          setTimeout(() => resultRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
+        } catch (e) {
+          setError(e.message);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const copyResult = () => {
+        navigator.clipboard.writeText(result);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      };
+
+      const renderMarkdown = (text) => {
+        return text
+          .replace(/^### (.+)$/gm, '<h3 class="md-h3">$1</h3>')
+          .replace(/^## (.+)$/gm, '<h2 class="md-h2">$1</h2>')
+          .replace(/^# (.+)$/gm, '<h1 class="md-h1">$1</h1>')
+          .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+          .replace(/^[-*] (.+)$/gm, '<li class="md-li">$1</li>')
+          .replace(/^(\d+)\. (.+)$/gm, '<li class="md-li-num">$2</li>')
+          .replace(/\n{2,}/g, '<br/><br/>')
+          .replace(/\n/g, '<br/>');
+      };
+
+      const handlePaste = (e) => {
+        const text = e.clipboardData?.getData("text") || "";
+        if (extractVideoId(text)) {
+          setUrl(text);
+          e.preventDefault();
+        }
+      };
+
+      const videoId = extractVideoId(url);
+
+      const s = {
+        card: { background: "rgba(255,255,255,0.05)", borderRadius: 12, padding: 16, marginBottom: 12, border: "1px solid rgba(255,255,255,0.08)" },
+        label: { fontSize: 11, fontWeight: 700, color: "#888", textTransform: "uppercase", letterSpacing: "0.5px", display: "block", marginBottom: 8 },
+        input: { width: "100%", padding: "11px 12px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(0,0,0,0.3)", color: "#fff", fontSize: 15, boxSizing: "border-box", outline: "none" },
+        select: { width: "100%", padding: "11px 12px", borderRadius: 8, border: "1px solid rgba(255,255,255,0.12)", background: "rgba(0,0,0,0.3)", color: "#fff", fontSize: 14, boxSizing: "border-box" },
+      };
+
+      return (
+        <div className="app-container" style={{ minHeight: "100vh", background: "linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%)", color: "#e0e0e0" }}>
+          <div style={{ maxWidth: 640, margin: "0 auto", padding: "24px 14px" }}>
+
+            {/* Header */}
+            <div style={{ textAlign: "center", marginBottom: 24 }}>
+              <h1 style={{ fontSize: 24, fontWeight: 800, margin: 0, background: "linear-gradient(90deg, #ff6b6b, #ffa94d, #ffd43b)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
+                ▶ YouTube Summarizer
+              </h1>
+              <p style={{ fontSize: 12, color: "#666", marginTop: 4 }}>Gemini API で動画を一瞬で要約</p>
+            </div>
+
+            {/* API Key */}
+            <div style={s.card}>
+              <span style={s.label}>Gemini API Key</span>
+              {keySaved ? (
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontSize: 14, color: "#4ade80", flex: 1 }}>✓ 保存済み（••••{apiKey.slice(-4)}）</span>
+                  <button onClick={clearKey} style={{ fontSize: 12, color: "#f87171", background: "none", border: "none", cursor: "pointer", textDecoration: "underline" }}>クリア</button>
+                </div>
+              ) : (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <div style={{ flex: 1, position: "relative" }}>
+                    <input
+                      type={keyVisible ? "text" : "password"}
+                      value={apiKey}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      placeholder="AIzaSy..."
+                      style={{...s.input, paddingRight: 40}}
+                    />
+                    <button onClick={() => setKeyVisible(!keyVisible)} style={{ position: "absolute", right: 8, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "#888", cursor: "pointer", fontSize: 18 }}>
+                      {keyVisible ? "🙈" : "👁"}
+                    </button>
+                  </div>
+                  <button onClick={saveKey} disabled={!apiKey.trim()} style={{ padding: "10px 18px", borderRadius: 8, border: "none", background: apiKey.trim() ? "#3b82f6" : "#333", color: "#fff", fontSize: 13, fontWeight: 700, cursor: apiKey.trim() ? "pointer" : "default", whiteSpace: "nowrap" }}>
+                    保存
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* URL */}
+            <div style={s.card}>
+              <span style={s.label}>YouTube URL</span>
+              <input
+                type="url"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                onPaste={handlePaste}
+                placeholder="URLをペーストするだけ"
+                style={s.input}
+              />
+              {videoId && (
+                <div style={{ marginTop: 10, borderRadius: 8, overflow: "hidden", aspectRatio: "16/9", background: "#000" }}>
+                  <img
+                    src={"https://img.youtube.com/vi/" + videoId + "/hqdefault.jpg"}
+                    alt=""
+                    style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                    onError={(e) => { e.target.style.display = "none"; }}
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Options */}
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+              <div style={{...s.card, marginBottom: 0}}>
+                <span style={s.label}>モデル</span>
+                <select value={model} onChange={(e) => setModel(e.target.value)} style={s.select}>
+                  {MODELS.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                </select>
+              </div>
+              <div style={{...s.card, marginBottom: 0}}>
+                <span style={s.label}>モード</span>
+                <select value={promptType} onChange={(e) => setPromptType(e.target.value)} style={s.select}>
+                  {Object.entries(PROMPTS).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+                </select>
+              </div>
+            </div>
+
+            {/* Custom */}
+            {promptType === "custom" && (
+              <div style={s.card}>
+                <span style={s.label}>カスタムプロンプト</span>
+                <textarea
+                  value={customPrompt}
+                  onChange={(e) => setCustomPrompt(e.target.value)}
+                  placeholder="例: この動画で紹介されている製品の比較表を作ってください"
+                  rows={3}
+                  style={{...s.input, resize: "vertical", fontFamily: "inherit"}}
+                />
+              </div>
+            )}
+
+            {/* Go */}
+            <button
+              onClick={summarize}
+              disabled={loading}
+              style={{
+                width: "100%", padding: 15, borderRadius: 12, border: "none",
+                background: loading ? "#333" : "linear-gradient(90deg, #ff6b6b, #ffa94d)",
+                color: "#fff", fontSize: 16, fontWeight: 700,
+                cursor: loading ? "default" : "pointer", marginBottom: 14,
+              }}
+            >
+              {loading ? (
+                <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                  <span style={{ display: "inline-block", width: 16, height: 16, border: "2px solid #555", borderTopColor: "#fff", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
+                  Gemini が動画を分析中...
+                </span>
+              ) : "🚀 要約する"}
+            </button>
+
+            {/* Error */}
+            {error && (
+              <div style={{ background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.25)", borderRadius: 10, padding: 12, marginBottom: 14, color: "#f87171", fontSize: 13 }}>
+                ⚠️ {error}
+              </div>
+            )}
+
+            {/* Result */}
+            {result && (
+              <div ref={resultRef} style={{...s.card, padding: 18}}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                  <span style={{ fontSize: 14, fontWeight: 700, color: "#ffa94d" }}>📋 結果</span>
+                  <button onClick={copyResult} style={{ fontSize: 12, padding: "6px 14px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.12)", background: copied ? "rgba(74,222,128,0.15)" : "rgba(255,255,255,0.05)", color: copied ? "#4ade80" : "#ccc", cursor: "pointer", transition: "all 0.2s" }}>
+                    {copied ? "✓ コピー済み" : "📄 コピー"}
+                  </button>
+                </div>
+                <div
+                  style={{ fontSize: 14, lineHeight: 1.85, color: "#ddd", overflowWrap: "break-word" }}
+                  dangerouslySetInnerHTML={{ __html: renderMarkdown(result) }}
+                />
+              </div>
+            )}
+
+            {/* History */}
+            {history.length > 0 && !loading && (
+              <div style={{...s.card, background: "rgba(255,255,255,0.02)"}}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: "#555", textTransform: "uppercase", letterSpacing: 1 }}>履歴</span>
+                  <button onClick={() => { setHistory([]); localStorage.removeItem(LS_HISTORY); }} style={{ fontSize: 11, color: "#555", background: "none", border: "none", cursor: "pointer" }}>クリア</button>
+                </div>
+                {history.slice(0, 5).map((h, i) => (
+                  <div
+                    key={i}
+                    onClick={() => { setUrl(h.url); setResult(h.result); setPromptType(h.promptType); setModel(h.model); }}
+                    style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: i < Math.min(history.length, 5) - 1 ? "1px solid rgba(255,255,255,0.04)" : "none", cursor: "pointer" }}
+                  >
+                    <img src={"https://img.youtube.com/vi/" + h.videoId + "/default.jpg"} alt="" style={{ width: 48, height: 36, borderRadius: 4, objectFit: "cover", flexShrink: 0 }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 12, color: "#999", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{h.url}</div>
+                      <div style={{ fontSize: 11, color: "#555" }}>{h.time} · {PROMPTS[h.promptType]?.label || h.promptType}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <style>{`
+            .md-h1 { font-size: 18px; font-weight: 700; margin: 20px 0 8px; color: #ffa94d; }
+            .md-h2 { font-size: 16px; font-weight: 700; margin: 18px 0 6px; color: #ffd43b; }
+            .md-h3 { font-size: 14px; font-weight: 700; margin: 14px 0 4px; color: #e0e0e0; }
+            .md-li { margin: 4px 0; margin-left: 20px; list-style: disc; }
+            .md-li-num { margin: 4px 0; margin-left: 20px; list-style: decimal; }
+          `}</style>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
